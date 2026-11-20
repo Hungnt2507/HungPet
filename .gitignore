@@ -1,0 +1,12 @@
+# Python / PyInstaller build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Private original backup files
+assets_kai_original/
+Kai_Desktop_Pet_Guide.pdf
