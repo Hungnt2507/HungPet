@@ -18,8 +18,31 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 if sys.platform == "win32":
     import winreg
+    from ctypes import wintypes
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    _user32.MonitorFromPoint.restype = wintypes.HMONITOR
+    _user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetMonitorInfoW.restype = wintypes.BOOL
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    _user32.SetWindowPos.restype = wintypes.BOOL
 else:
     winreg = None
+    _user32 = None
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
@@ -120,24 +143,49 @@ def find_font_file() -> Optional[str]:
     return None
 
 
-def get_work_area(root: tk.Tk) -> Tuple[int, int, int, int]:
-    """Return usable desktop bounds (left, top, right, bottom) above taskbar."""
-    if sys.platform == "win32":
+def get_work_area(
+    root: tk.Tk, point_x: Optional[float] = None, point_y: Optional[float] = None
+) -> Tuple[int, int, int, int]:
+    """Return usable desktop bounds (left, top, right, bottom) of the monitor at point."""
+    if sys.platform == "win32" and _user32 is not None:
         try:
-            class RECT(ctypes.Structure):
-                _fields_ = [
-                    ("left", ctypes.c_long),
-                    ("top", ctypes.c_long),
-                    ("right", ctypes.c_long),
-                    ("bottom", ctypes.c_long),
-                ]
+            if point_x is not None and point_y is not None:
+                hmon = _user32.MonitorFromPoint(wintypes.POINT(int(point_x), int(point_y)), 2)
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if hmon and _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    return mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom
 
-            rect = RECT()
+            rect = wintypes.RECT()
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
                 return rect.left, rect.top, rect.right, rect.bottom
         except Exception:
             pass
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def clamp_to_monitor(
+    root: tk.Tk, x: float, y: float, w: int, h: int, ref_x: float, ref_y: float
+) -> Tuple[int, int]:
+    """Clamp window (x, y) inside the usable work area of the monitor containing (ref_x, ref_y)."""
+    wl, wt, wr, wb = get_work_area(root, ref_x, ref_y)
+    cx = max(wl + 8, min(int(x), wr - w - 8))
+    cy = max(wt + 8, min(int(y), wb - h - 8))
+    return cx, cy
+
+
+def keep_window_topmost(win: Optional[tk.Misc]) -> None:
+    """Re-assert topmost Z-order without activating or stealing focus."""
+    if win is None:
+        return
+    try:
+        if sys.platform == "win32" and _user32 is not None:
+            hwnd = _user32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+            _user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        else:
+            win.wm_attributes("-topmost", True)
+    except Exception:
+        pass
 
 
 def prep_photo(
@@ -343,9 +391,7 @@ class AttachedBubble:
                     extra_lift = 66
             x = int(pet_x + pet_w / 2 - w / 2)
             y = int(pet_y - h + 4 - extra_lift)
-            sw = self.parent.winfo_screenwidth()
-            x = max(8, min(x, sw - w - 8))
-            y = max(8, y)
+            x, y = clamp_to_monitor(self.parent, x, y, w, h, pet_x + pet_w / 2, pet_y)
             self.win.geometry(f"+{x}+{y}")
         except Exception:
             pass
@@ -394,7 +440,9 @@ class FloatingImagePopup:
     ) -> Tuple[int, int]:
         x = int(pet_x + pet_w / 2 - self.img_size[0] / 2)
         y = int(pet_y - self.img_size[1] + 4 + pop_offset + bob)
-        return x, max(6, y)
+        return clamp_to_monitor(
+            self.parent, x, y, self.img_size[0], self.img_size[1], pet_x + pet_w / 2, pet_y
+        )
 
     def show(self, pet_x: float, pet_y: float, pet_w: int) -> None:
         self.hide()
@@ -462,12 +510,14 @@ class ThoughtBubblePopup(FloatingImagePopup):
     def _compute_pos(
         self, pet_x: float, pet_y: float, pet_w: int, pop_offset: float, bob: float
     ) -> Tuple[int, int]:
-        sw = self.parent.winfo_screenwidth()
+        wl, _wt, wr, _wb = get_work_area(self.parent, pet_x + pet_w / 2, pet_y)
         x = int(pet_x + pet_w * 0.46)
-        if x + self.img_size[0] > sw - 8:
-            x = max(8, int(pet_x - self.img_size[0] * 0.45))
+        if x + self.img_size[0] > wr - 8:
+            x = max(wl + 8, int(pet_x - self.img_size[0] * 0.45))
         y = int(pet_y - 104 + pop_offset + bob)
-        return x, max(6, y)
+        return clamp_to_monitor(
+            self.parent, x, y, self.img_size[0], self.img_size[1], pet_x + pet_w / 2, pet_y
+        )
 
 
 class BaseFloatingCard:
@@ -752,11 +802,11 @@ class BaseFloatingCard:
         self.win = m
 
         mw, mh = img.size
-        sw, sh = self.pet.win.winfo_screenwidth(), self.pet.win.winfo_screenheight()
         pet_cx = self.pet.x + self.pet.canvas_pad + self.pet.pet_size / 2
         pet_top = self.pet.y + self.pet.canvas_pad
-        x = max(8, min(int(pet_cx - mw / 2), sw - mw - 8))
-        y = max(8, min(int(pet_top - mh + 2), sh - mh - 48))
+        x, y = clamp_to_monitor(
+            self.pet.win, int(pet_cx - mw / 2), int(pet_top - mh + 2), mw, mh, pet_cx, pet_top
+        )
         m.geometry(f"+{x}+{y}")
 
         if auto_close_ms is not None:
@@ -933,10 +983,8 @@ class CleanSettingsMenu:
 
         m.update_idletasks()
         mw, mh = m.winfo_width(), m.winfo_height()
-        sw, sh = self.pet.win.winfo_screenwidth(), self.pet.win.winfo_screenheight()
-        x = min(screen_x, sw - mw - 12)
-        y = min(screen_y, sh - mh - 48)
-        m.geometry(f"+{max(8, x)}+{max(8, y)}")
+        x, y = clamp_to_monitor(self.pet.win, screen_x, screen_y, mw, mh, screen_x, screen_y)
+        m.geometry(f"+{x}+{y}")
 
         m.bind("<FocusOut>", lambda _e: self.hide())
         m.focus_force()
@@ -1216,6 +1264,14 @@ class KaiDesktopPet:
         self.particles: List[FxParticle] = []
         self.click_cycle = 0
         self.auto_romance_timer = random.randint(1800, 3600)
+        self._last_photo = self.photos_normal[1]
+        self._had_fx = False
+        self._last_geom: Optional[str] = None
+        self.pet_item = self.canvas.create_image(
+            self.canvas_pad + self.pet_size / 2,
+            self.canvas_pad + self.pet_size / 2,
+            image=self._last_photo,
+        )
 
         self.last_night_slot: Optional[str] = None
         self.last_hourly_slot: Optional[str] = None
@@ -1232,6 +1288,25 @@ class KaiDesktopPet:
         self.win.after(600, self.check_startup_greeting)
         self.loop()
 
+    def refresh_work_area(self) -> None:
+        self.work_left, self.work_top, self.work_right, self.work_bottom = get_work_area(
+            self.win, self.x + self.win_size / 2, self.y + self.win_size / 2
+        )
+
+    def _ensure_topmost(self) -> None:
+        keep_window_topmost(self.win)
+        for popup in (
+            self.bubble,
+            self.heart_popup,
+            self.thought_popup,
+            self.chat_popup,
+            self.feed_popup,
+            self.note_popup,
+            self.settings_menu,
+        ):
+            if popup is not None:
+                keep_window_topmost(popup.win)
+
     def _rebuild_sprite_cache(self) -> None:
         sz = (self.pet_size, self.pet_size)
         for i, im in self.raw_sprites.items():
@@ -1244,9 +1319,13 @@ class KaiDesktopPet:
         self.win_size = self.pet_size + self.canvas_pad * 2
         self.canvas.configure(width=self.win_size, height=self.win_size)
         self._rebuild_sprite_cache()
+        self._last_photo = None
+        self._last_geom = None
+        self.refresh_work_area()
         floor_y = self.work_bottom - self.win_size + self.canvas_pad
         if self.y > floor_y:
             self.y = float(floor_y)
+        self.x = max(float(self.work_left), min(self.x, float(self.work_right - self.win_size)))
         self.update_pos()
 
     def check_startup_greeting(self) -> None:
@@ -1340,6 +1419,8 @@ class KaiDesktopPet:
             self.say_click_message()
             return
 
+        self.refresh_work_area()
+        self.x = max(float(self.work_left), min(self.x, float(self.work_right - self.win_size)))
         floor_y = self.work_bottom - self.win_size + self.canvas_pad
         if self.y < floor_y - 6:
             self.state = "fall"
@@ -1547,10 +1628,14 @@ class KaiDesktopPet:
 
         if self.frame % 30 == 0:
             self.check_time_triggers()
+        if self.frame % 45 == 0:
+            self._ensure_topmost()
+        if self.frame % 150 == 0 and self.state not in ("drag", "fall"):
+            self.refresh_work_area()
 
         floor_y = self.work_bottom - self.win_size + self.canvas_pad
-        left_lim = self.work_left - self.canvas_pad
-        right_lim = self.work_right - self.win_size + self.canvas_pad
+        left_lim = self.work_left
+        right_lim = self.work_right - self.win_size
 
         if self.state == "drag":
             if self.drag_dir_hold > 0:
@@ -1662,7 +1747,6 @@ class KaiDesktopPet:
 
     def draw(self) -> None:
         c = self.canvas
-        c.delete("all")
 
         sprite_idx, bob, use_mirrored = self.current_sprite_and_offset()
         if use_mirrored and sprite_idx in self.photos_mirrored:
@@ -1670,12 +1754,17 @@ class KaiDesktopPet:
         else:
             photo = self.photos_normal[sprite_idx]
 
-        c.create_image(
+        if photo is not self._last_photo:
+            c.itemconfig(self.pet_item, image=photo)
+            self._last_photo = photo
+        c.coords(
+            self.pet_item,
             self.canvas_pad + self.pet_size / 2,
             self.canvas_pad + self.pet_size / 2 + bob,
-            image=photo,
         )
 
+        if self._had_fx or self.particles:
+            c.delete("fx")
         alive: List[FxParticle] = []
         for p in self.particles:
             p.x += p.vx + math.sin(self.frame * 0.25 + p.sway_phase) * 0.35
@@ -1683,12 +1772,16 @@ class KaiDesktopPet:
             p.vy += p.gravity
             p.life += 1
             if p.life < p.max_life and p.img_key in self.fx_photos:
-                c.create_image(p.x, p.y, image=self.fx_photos[p.img_key])
+                c.create_image(p.x, p.y, image=self.fx_photos[p.img_key], tags="fx")
                 alive.append(p)
         self.particles = alive
+        self._had_fx = bool(alive)
 
     def update_pos(self) -> None:
-        self.win.geometry(f"{self.win_size}x{self.win_size}+{int(self.x)}+{int(self.y)}")
+        geom = f"{self.win_size}x{self.win_size}+{int(self.x)}+{int(self.y)}"
+        if geom != self._last_geom:
+            self.win.geometry(geom)
+            self._last_geom = geom
 
     def loop(self) -> None:
         self.step()
